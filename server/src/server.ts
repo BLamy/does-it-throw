@@ -5,7 +5,17 @@ import {
   ProposedFeatures,
   TextDocumentSyncKind,
   TextDocuments,
-  createConnection
+  createConnection,
+  HoverParams,
+  Hover,
+  MarkupKind,
+  CodeActionParams,
+  CodeAction,
+  CodeActionKind,
+  TextEdit,
+  WorkspaceEdit,
+  Range,
+  Position
 } from 'vscode-languageserver/node'
 
 import { access, constants, readFile } from 'fs/promises'
@@ -20,6 +30,9 @@ const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument)
 let hasConfigurationCapability = false
 let hasWorkspaceFolderCapability = false
 
+// Cache analysis results for hover and code actions
+const analysisCache = new Map<string, ParseResult>()
+
 connection.onInitialize((params: InitializeParams) => {
   const capabilities = params.capabilities
 
@@ -30,7 +43,11 @@ connection.onInitialize((params: InitializeParams) => {
 
   const result: InitializeResult = {
     capabilities: {
-      textDocumentSync: TextDocumentSyncKind.Incremental
+      textDocumentSync: TextDocumentSyncKind.Incremental,
+      hoverProvider: true,
+      codeActionProvider: {
+        codeActionKinds: [CodeActionKind.QuickFix]
+      }
     }
   }
   if (hasWorkspaceFolderCapability) {
@@ -119,6 +136,7 @@ function getDocumentSettings(resource: string): Thenable<Settings> {
 // Only keep settings for open documents
 documents.onDidClose((e) => {
   documentSettings.delete(e.document.uri)
+  analysisCache.delete(e.document.uri)
 })
 
 // The content of a text document has changed. This event is emitted
@@ -152,6 +170,372 @@ const findFirstFileThatExists = async (uri: string, relative_import: string) => 
   return Promise.any(files.map(_checkAccessOnFile))
 }
 
+// Add hover support
+connection.onHover((params: HoverParams): Hover | null => {
+  const document = documents.get(params.textDocument.uri)
+  if (!document) {
+    return null
+  }
+
+  const analysis = analysisCache.get(params.textDocument.uri)
+  if (!analysis) {
+    return null
+  }
+
+  const position = params.position
+  const offset = document.offsetAt(position)
+
+  // Check if hovering over a function call that might throw
+  const hoverInfo = findFunctionCallAtPosition(analysis, offset, document)
+  if (hoverInfo) {
+    const { functionName, errorTypes, isDocumented } = hoverInfo
+    
+    if (!isDocumented && errorTypes.length > 0) {
+      const suggestedComment = `/**\n${errorTypes.map((type: string) => ` * @throws {${type}}`).join('\n')}\n */`
+      const markdown = [
+        `**Function Call**: \`${functionName}()\``,
+        '',
+        `**May throw**: ${errorTypes.map((type: string) => `\`${type}\``).join(', ')}`,
+        '',
+        '💡 **Suggestion**: Add throws annotation to document potential errors:',
+        '```javascript',
+        suggestedComment,
+        `function yourFunction() {`,
+        `  ${functionName}(); // This call may throw`,
+        `}`,
+        '```',
+        '',
+        '*Use Ctrl+. (Cmd+. on Mac) for quick fix*'
+      ].join('\n')
+
+      return {
+        contents: {
+          kind: MarkupKind.Markdown,
+          value: markdown
+        }
+      }
+    }
+  }
+
+  return null
+})
+
+// Add code action support
+connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
+  const document = documents.get(params.textDocument.uri)
+  if (!document) {
+    return []
+  }
+
+  const analysis = analysisCache.get(params.textDocument.uri)
+  if (!analysis) {
+    return []
+  }
+
+  const actions: CodeAction[] = []
+  const range = params.range
+
+  // NEW: Check for partial documentation diagnostics with quick fix data
+  for (const diagnostic of analysis.diagnostics) {
+    const diagnosticRange = Range.create(
+      Position.create(diagnostic.range.start.line, diagnostic.range.start.character),
+      Position.create(diagnostic.range.end.line, diagnostic.range.end.character)
+    )
+    
+    // Check if diagnostic range overlaps with the requested range
+    if (rangesOverlap(range, diagnosticRange)) {
+      
+      // 1. Handle partial documentation (add missing @throws to existing JSDoc)
+      if (diagnostic.message.includes('JSDoc defines') && diagnostic.data) {
+        const data = diagnostic.data as any
+        if (data.quickFixType === 'addMissingThrows') {
+          const undocumentedTypes = data.undocumentedTypes as string[]
+          
+          const jsdocPosition = findJSDocCommentPosition(document, diagnosticRange.start)
+          if (jsdocPosition) {
+            const newThrowsLines = undocumentedTypes.map(errorType => 
+              ` * @throws {${errorType}} TODO: Add description`
+            ).join('\n')
+            
+            const edit: WorkspaceEdit = {
+              changes: {
+                [params.textDocument.uri]: [
+                  TextEdit.insert(jsdocPosition, `${newThrowsLines}\n`)
+                ]
+              }
+            }
+
+            actions.push({
+              title: `Add missing @throws: ${undocumentedTypes.join(', ')}`,
+              kind: CodeActionKind.QuickFix,
+              edit: edit,
+              isPreferred: true,
+              diagnostics: [diagnostic]
+            })
+          }
+        }
+      }
+      
+      // 2. Handle try/catch suggestion (wrap function call)
+      else if (diagnostic.data) {
+        const data = diagnostic.data as any
+        if (data.quickFixType === 'addTryCatch') {
+          const functionName = data.functionName as string
+          const errorTypes = data.errorTypes as string[]
+          
+          // Find the line containing the function call
+          const lineText = document.getText(Range.create(
+            Position.create(diagnosticRange.start.line, 0),
+            Position.create(diagnosticRange.start.line + 1, 0)
+          ))
+          
+          // Find the indentation of the current line
+          const indentMatch = lineText.match(/^(\s*)/)
+          const indent = indentMatch ? indentMatch[1] : ''
+          
+          // Create try/catch wrapper
+          const tryStart = `${indent}try {\n${indent}  `
+          const catchBlock = `\n${indent}} catch (error) {\n${indent}  // Handle ${errorTypes.join(', ')} error\n${indent}  console.error('Error in ${functionName}():', error);\n${indent}  // TODO: Add proper error handling\n${indent}}`
+          
+          const edit: WorkspaceEdit = {
+            changes: {
+              [params.textDocument.uri]: [
+                TextEdit.insert(Position.create(diagnosticRange.start.line, 0), tryStart),
+                TextEdit.insert(Position.create(diagnosticRange.end.line + 1, 0), catchBlock)
+              ]
+            }
+          }
+
+          actions.push({
+            title: `Wrap ${functionName}() call in try/catch`,
+            kind: CodeActionKind.QuickFix,
+            edit: edit,
+            isPreferred: false, // Less preferred than JSDoc option
+            diagnostics: [diagnostic]
+          })
+        }
+        
+        // 3. Handle JSDoc @throws suggestion (add to containing function)
+        else if (data.quickFixType === 'addJSDocThrows') {
+          const functionName = data.functionName as string
+          const errorTypes = data.errorTypes as string[]
+          
+          // Find the containing function
+          const containingFunction = findContainingFunction(document, diagnosticRange.start)
+          
+          if (containingFunction) {
+            // Check if function already has JSDoc
+            const existingJSDocPosition = findJSDocCommentPosition(document, containingFunction.start)
+            
+            if (existingJSDocPosition) {
+              // Add to existing JSDoc
+              const newThrowsLines = errorTypes.map(errorType => 
+                ` * @throws {${errorType}} TODO: Add description`
+              ).join('\n')
+              
+              const edit: WorkspaceEdit = {
+                changes: {
+                  [params.textDocument.uri]: [
+                    TextEdit.insert(existingJSDocPosition, `${newThrowsLines}\n`)
+                  ]
+                }
+              }
+
+              actions.push({
+                title: `Add @throws to JSDoc: ${errorTypes.join(', ')}`,
+                kind: CodeActionKind.QuickFix,
+                edit: edit,
+                isPreferred: true, // Preferred over try/catch
+                diagnostics: [diagnostic]
+              })
+            } else {
+              // Create new JSDoc block
+              const jsdocBlock = [
+                '/**',
+                ...errorTypes.map(errorType => ` * @throws {${errorType}} TODO: Add description`),
+                ' */'
+              ].join('\n')
+              
+              const edit: WorkspaceEdit = {
+                changes: {
+                  [params.textDocument.uri]: [
+                    TextEdit.insert(containingFunction.start, `${jsdocBlock}\n`)
+                  ]
+                }
+              }
+
+              actions.push({
+                title: `Add JSDoc with @throws: ${errorTypes.join(', ')}`,
+                kind: CodeActionKind.QuickFix,
+                edit: edit,
+                isPreferred: true, // Preferred over try/catch
+                diagnostics: [diagnostic]
+              })
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return actions
+})
+
+function findJSDocCommentPosition(document: TextDocument, functionStart: Position): Position | null {
+  const text = document.getText()
+  
+  // Work backwards from the function to find the JSDoc comment
+  let currentLine = functionStart.line - 1
+  
+  while (currentLine >= 0) {
+    const lineText = document.getText(Range.create(
+      Position.create(currentLine, 0),
+      Position.create(currentLine + 1, 0)
+    )).trim()
+    
+    // Look for the end of a JSDoc comment
+    if (lineText.includes('*/')) {
+      // Insert before the closing */
+      const line = document.getText(Range.create(
+        Position.create(currentLine, 0),
+        Position.create(currentLine + 1, 0)
+      ))
+      
+      // Find where */ appears in the line
+      const closingIndex = line.indexOf('*/')
+      if (closingIndex !== -1) {
+        return Position.create(currentLine, closingIndex)
+      }
+    }
+    
+    // If we hit a line that doesn't look like a comment, stop searching
+    if (!lineText.startsWith('*') && !lineText.startsWith('/**') && lineText.length > 0) {
+      break
+    }
+    
+    currentLine--
+  }
+  
+  return null
+}
+
+// Helper functions for hover and code actions
+function findFunctionCallAtPosition(analysis: ParseResult, offset: number, document: TextDocument): { functionName: string, errorTypes: string[], isDocumented: boolean } | null {
+  // Find diagnostics that represent function calls at the given position
+  for (const diagnostic of analysis.diagnostics) {
+    const start = document.offsetAt(Position.create(diagnostic.range.start.line, diagnostic.range.start.character))
+    const end = document.offsetAt(Position.create(diagnostic.range.end.line, diagnostic.range.end.character))
+    
+    if (offset >= start && offset <= end) {
+      // Check if this is a function call diagnostic
+      if (diagnostic.message.includes('calls') && diagnostic.message.includes('which throws')) {
+        // Extract function name and error types from message
+        // Updated regex to match: "Function calls XYZ() which throws ABC, DEF - add..."
+        const match = diagnostic.message.match(/Function calls (\w+)\(\) which throws (.+?) -/)
+        if (match) {
+          const functionName = match[1]
+          const errorTypesStr = match[2]
+          const errorTypes = errorTypesStr.split(', ').map((type: string) => type.trim())
+          
+          return {
+            functionName,
+            errorTypes,
+            isDocumented: false
+          }
+        }
+      }
+    }
+  }
+  
+  return null
+}
+
+function findFunctionCallsInRange(analysis: ParseResult, range: Range, document: TextDocument): Array<{ position: Position, functionName: string, errorTypes: string[], isDocumented: boolean }> {
+  const calls: Array<{ position: Position, functionName: string, errorTypes: string[], isDocumented: boolean }> = []
+  
+  for (const diagnostic of analysis.diagnostics) {
+    const diagnosticRange = Range.create(
+      Position.create(diagnostic.range.start.line, diagnostic.range.start.character),
+      Position.create(diagnostic.range.end.line, diagnostic.range.end.character)
+    )
+    
+    // Check if diagnostic range overlaps with the given range
+    if (rangesOverlap(range, diagnosticRange)) {
+      if (diagnostic.message.includes('calls') && diagnostic.message.includes('which throws')) {
+        // Updated regex to match: "Function calls XYZ() which throws ABC, DEF - add..."
+        const match = diagnostic.message.match(/Function calls (\w+)\(\) which throws (.+?) -/)
+        if (match) {
+          const functionName = match[1]
+          const errorTypesStr = match[2]
+          const errorTypes = errorTypesStr.split(', ').map((type: string) => type.trim())
+          
+          calls.push({
+            position: Position.create(diagnostic.range.start.line, diagnostic.range.start.character),
+            functionName,
+            errorTypes,
+            isDocumented: false
+          })
+        }
+      }
+    }
+  }
+  
+  return calls
+}
+
+function rangesOverlap(range1: Range, range2: Range): boolean {
+  const start1 = range1.start
+  const end1 = range1.end
+  const start2 = range2.start
+  const end2 = range2.end
+  
+  return !(
+    (end1.line < start2.line || (end1.line === start2.line && end1.character < start2.character)) ||
+    (end2.line < start1.line || (end2.line === start1.line && end2.character < start1.character))
+  )
+}
+
+function findContainingFunction(document: TextDocument, position: Position): { start: Position, name: string } | null {
+  const text = document.getText()
+  const offset = document.offsetAt(position)
+  
+  // Simple regex to find function declarations before the position
+  const functionRegex = /(?:function\s+(\w+)|(\w+)\s*(?::\s*\w+)?\s*=>|(\w+)\s*\([^)]*\)\s*{)/g
+  
+  let match
+  let lastFunction: { start: Position, name: string } | null = null
+  
+  while ((match = functionRegex.exec(text)) !== null) {
+    if (match.index > offset) {
+      break
+    }
+    
+    const functionName = match[1] || match[2] || match[3] || 'anonymous'
+    const functionStart = document.positionAt(match.index)
+    
+    lastFunction = {
+      start: functionStart,
+      name: functionName
+    }
+  }
+  
+  return lastFunction
+}
+
+function getCommentInsertPosition(document: TextDocument, func: { start: Position, name: string }): Position {
+  const line = func.start.line
+  const lineText = document.getText(Range.create(Position.create(line, 0), Position.create(line + 1, 0)))
+  
+  // Find the end of the function signature (before the opening brace)
+  const braceIndex = lineText.indexOf('{')
+  if (braceIndex !== -1) {
+    return Position.create(line, braceIndex)
+  }
+  
+  // Fallback: end of the line
+  return Position.create(line, lineText.trim().length)
+}
+
 async function validateTextDocument(textDocument: TextDocument): Promise<void> {
   let settings = await getDocumentSettings(textDocument.uri)
   if (!settings) {
@@ -176,6 +560,9 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
       ignore_statements: settings?.ignoreStatements ?? defaultSettings.ignoreStatements
     } satisfies InputData
     const analysis = parse_js(opts) as ParseResult
+
+    // Cache the analysis for hover and code actions
+    analysisCache.set(textDocument.uri, analysis)
 
     if (analysis.relative_imports.length > 0) {
       const filePromises = analysis.relative_imports.map(async (relative_import) => {
@@ -234,6 +621,8 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
     connection.console.error(`settings are: ${JSON.stringify(settings)}`)
     connection.console.error(`Error: ${e instanceof Error ? e.message : JSON.stringify(e)} error`)
     connection.sendDiagnostics({ uri: textDocument.uri, diagnostics: [] })
+    // Clear cache on error
+    analysisCache.delete(textDocument.uri)
   }
 }
 

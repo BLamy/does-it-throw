@@ -23,12 +23,110 @@ Also supports **call expressions**:
 
 ![demo](./assets/calltothrow.gif)
 
+## How It Works
+
+Does it Throw analyzes your JavaScript/TypeScript code using a fast Rust-based parser (SWC) to identify:
+
+1. **Direct Throw Statements** - Functions that contain `throw` statements
+2. **Call Expressions** - Function calls that may throw based on the called function's behavior
+3. **JSDoc Documentation** - Functions with `@throws` annotations for proper error documentation
+
+The analysis provides real-time diagnostics in your editor, helping you:
+- Understand which functions can throw errors
+- Document error handling with JSDoc annotations
+- Handle errors appropriately with try/catch blocks
+- Maintain better control flow in your codebase
+
+## JSDoc @throws Support
+
+The latest version includes comprehensive support for JSDoc `@throws` annotations, enabling proper error documentation and validation.
+
+### Basic Usage
+
+Document what errors your functions throw:
+
+```javascript
+/**
+ * Validates user input
+ * @param {string} input - The input to validate
+ * @throws {TypeError} When input is not a string
+ * @throws {ValidationError} When input is empty or invalid
+ */
+function validateInput(input) {
+  if (typeof input !== 'string') {
+    throw new TypeError('Input must be a string');
+  }
+  if (!input.trim()) {
+    throw new ValidationError('Input cannot be empty');
+  }
+  return input.trim();
+}
+```
+
+### Supported Formats
+
+The tool supports multiple JSDoc `@throws` annotation formats:
+
+```javascript
+// With curly braces (recommended)
+/** @throws {Error} Description of when this error occurs */
+
+// Multiple throws
+/**
+ * @throws {TypeError} When type is invalid
+ * @throws {RangeError} When value is out of range
+ * @throws {CustomError} When custom validation fails
+ */
+
+// Legacy format (comma-separated)
+/** @throws Error, TypeError when something goes wrong */
+```
+
+### Error Coverage Analysis
+
+The tool validates that your JSDoc documentation matches your actual throw statements:
+
+```javascript
+/**
+ * @throws {TypeError} When input is invalid
+ */
+function example(input) {
+  if (!input) throw new TypeError('Invalid input');  // ✅ Documented
+  if (input.length > 100) throw new RangeError('Too long');  // ❌ Undocumented!
+}
+```
+
+In this case, you'll get a diagnostic: `"JSDoc defines TypeError, but not RangeError"`
+
+### Call Chain Documentation
+
+When a documented function calls another documented function, the tool can suppress redundant diagnostics:
+
+```javascript
+/**
+ * @throws {ValidationError} When validation fails
+ */
+function processData(data) {
+  validateInput(data);  // No diagnostic if ValidationError is covered
+  return data.toUpperCase();
+}
+```
+
+### Benefits
+
+- **Better Error Handling**: Know what errors to expect and handle
+- **Documentation Consistency**: Ensure your docs match your code
+- **Code Maintenance**: Easily see which functions need error handling
+- **Team Communication**: Clear error contracts between developers
+
 <!-- JetBrains Plugin description 2 -->
 ## Why?
 
 Maybe you're working on a large codebase riddled with throw statements everywhere, and you want a better control flow. Or perhaps you're just curious about how many throw statements you have in your codebase. This simple tool can help you with that.
 
 Untyped `throw` statements can be a pain for those who come from languages like Go, where errors are typically values and first-class citizens. Even Rust has the `Result` type. Knowing where throw statements are in your codebase might be helpful, even if their return types aren't [directly supported](https://github.com/microsoft/TypeScript/issues/13219).
+
+With the new JSDoc `@throws` support, you can now document your error handling contracts and ensure they stay in sync with your actual code, providing a lightweight alternative to typed error handling.
 
 > This extension may not be for everyone, but it's definitely for me. I hope you find it useful too.
 
@@ -56,6 +154,7 @@ For a usage and configuration guide, check out the [usage](https://github.com/mi
 - This extension is still in its early stages. It's not perfect, but hope to gain sufficient ECMAScript coverage over time.
 - Currently, it only supports ECMAScript files and the following file types: `.ts`, `.js`, `.tsx` and `.jsx`.
 - Call expression tracing (Aka "Calls to Throws") is now set to one level deep. Hope to make this configurable in the future!
+- JSDoc parsing supports standard formats but may not catch all edge cases in complex documentation
 
 > To view all known limitations, please see the [issues](https://github.com/michaelangeloio/does-it-throw/issues) page.
 

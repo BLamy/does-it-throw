@@ -16,6 +16,7 @@ use swc_ecma_ast::{
 use self::swc_common::{comments::Comments, sync::Lrc, Span};
 use self::swc_ecma_ast::{
   CallExpr, Expr, Function, ImportDecl, ImportSpecifier, MemberProp, ModuleExportName, ThrowStmt,
+  Lit,
 };
 
 use self::swc_ecma_visit::Visit;
@@ -27,6 +28,29 @@ fn prop_name_to_string(prop_name: &PropName) -> String {
     PropName::Num(num) => num.value.to_string(),
     _ => "anonymous".to_string(), // Fallback for unnamed functions
   }
+}
+
+#[derive(Clone, Debug)]
+pub struct ThrowDetails {
+  pub error_type: Option<String>,    // "Error", "TypeError", etc.
+  pub error_message: Option<String>, // Literal string if available
+  pub is_custom_error: bool,         // true for custom classes
+}
+
+impl Default for ThrowDetails {
+  fn default() -> Self {
+    ThrowDetails {
+      error_type: None,
+      error_message: None,
+      is_custom_error: false,
+    }
+  }
+}
+
+#[derive(Clone, Debug)]
+pub struct ThrowsAnnotation {
+  pub error_types: Vec<String>,          // ["Error", "TypeError"] 
+  pub is_documented: bool,               // Has throws annotation
 }
 
 #[derive(Clone)]
@@ -52,6 +76,7 @@ impl<'throwfinder_settings> Clone for ThrowFinderSettings<'throwfinder_settings>
 pub struct ThrowFinder<'throwfinder_settings> {
   comments: Lrc<dyn Comments>,
   pub throw_spans: Vec<Span>,
+  pub throw_details: Vec<ThrowDetails>, // NEW: Store error details for each throw
   context_stack: Vec<BlockContext>, // Stack to track try/catch context
   pub throwfinder_settings: &'throwfinder_settings ThrowFinderSettings<'throwfinder_settings>,
 }
@@ -65,10 +90,67 @@ impl<'throwfinder_settings> ThrowFinder<'throwfinder_settings> {
     Self {
       comments,
       throw_spans: vec![],
+      throw_details: vec![], // NEW: Initialize empty details vector
       context_stack: vec![],
       throwfinder_settings,
     }
   }
+
+  fn analyze_throw_expression(&self, expr: &Expr) -> ThrowDetails {
+    match expr {
+      // new Error("message")
+      Expr::New(new_expr) => {
+        if let Expr::Ident(ident) = &*new_expr.callee {
+          let error_type = ident.sym.to_string();
+          let message = new_expr.args.as_ref()
+            .and_then(|args| args.first())
+            .and_then(|arg| self.extract_string_literal(&arg.expr));
+
+          ThrowDetails {
+            error_type: Some(error_type.clone()),
+            error_message: message,
+            is_custom_error: !is_built_in_error(&error_type),
+          }
+        } else {
+          ThrowDetails::default()
+        }
+      }
+      // throw "string literal"
+      Expr::Lit(lit) => {
+        if let Lit::Str(str_lit) = lit {
+          ThrowDetails {
+            error_type: None,
+            error_message: Some(str_lit.value.to_string()),
+            is_custom_error: false,
+          }
+        } else {
+          ThrowDetails::default()
+        }
+      }
+      // throw variable
+      Expr::Ident(ident) => {
+        ThrowDetails {
+          error_type: Some(format!("variable: {}", ident.sym)),
+          error_message: None,
+          is_custom_error: false,
+        }
+      }
+      _ => ThrowDetails::default()
+    }
+  }
+
+  fn extract_string_literal(&self, expr: &Expr) -> Option<String> {
+    if let Expr::Lit(Lit::Str(str_lit)) = expr {
+      Some(str_lit.value.to_string())
+    } else {
+      None
+    }
+  }
+}
+
+fn is_built_in_error(name: &str) -> bool {
+  matches!(name, "Error" | "TypeError" | "ReferenceError" | "RangeError" |
+                 "SyntaxError" | "URIError" | "EvalError" | "AggregateError")
 }
 
 impl<'throwfinder_settings> Visit for ThrowFinder<'throwfinder_settings> {
@@ -88,13 +170,18 @@ impl<'throwfinder_settings> Visit for ThrowFinder<'throwfinder_settings> {
       .is_some();
 
     if !has_it_throws_comment {
+      // NEW: Extract error details from the throw expression
+      let throw_details = self.analyze_throw_expression(&node.arg);
+
       if *self.throwfinder_settings.include_try_statements {
         self.throw_spans.push(node.span);
+        self.throw_details.push(throw_details); // NEW: Store details
       } else {
         let context = self.current_context();
         if context.map_or(true, |ctx| ctx.try_count == ctx.catch_count) {
           // Add throw span if not within an unbalanced try block
           self.throw_spans.push(node.span);
+          self.throw_details.push(throw_details); // NEW: Store details
         }
       }
     }
@@ -165,6 +252,8 @@ pub struct ThrowMap {
   pub function_or_method_name: String,
   pub class_name: Option<String>,
   pub id: String,
+  pub throw_details: Vec<ThrowDetails>,             // NEW: Error details for each throw
+  pub throws_annotation: Option<ThrowsAnnotation>,  // NEW: Function-level throws annotation
 }
 
 impl PartialEq for ThrowMap {
@@ -201,6 +290,9 @@ impl<'throwfinder_settings> ThrowAnalyzer<'throwfinder_settings> {
     let mut throw_finder = ThrowFinder::new(&self.throwfinder_settings, self.comments.clone());
     throw_finder.visit_function(function);
     if !throw_finder.throw_spans.is_empty() {
+      // NEW: Extract throws annotation from function comments
+      let throws_annotation = self.extract_throws_annotation(function.span);
+
       let throw_map = ThrowMap {
         throw_spans: throw_finder.throw_spans,
         throw_statement: function.span,
@@ -222,8 +314,116 @@ impl<'throwfinder_settings> ThrowAnalyzer<'throwfinder_settings> {
             .cloned()
             .unwrap_or_else(|| "<anonymous>".to_string())
         ),
+        throw_details: throw_finder.throw_details,  // NEW: Pass error details from ThrowFinder
+        throws_annotation,                          // NEW: Add throws annotation
       };
       self.functions_with_throws.insert(throw_map);
+    }
+  }
+
+  fn extract_throws_annotation(&self, function_span: Span) -> Option<ThrowsAnnotation> {
+    // Simple approach: Look for leading comments before the function
+    // Also search in a range before the function to catch comments attached to parent declarations
+    
+    // Strategy 1: Direct leading comments at function start
+    if let Some(comments) = self.comments.get_leading(function_span.lo()) {
+      for comment in comments {
+        if let Some(annotation) = self.parse_throws_comment(&comment.text) {
+          #[cfg(debug_assertions)]
+          eprintln!("   ✅ Found throws annotation in direct leading comment: {:?}", annotation);
+          return Some(annotation);
+        }
+      }
+    }
+    
+    // Strategy 2: Search backwards for comments (to catch variable declaration comments)
+    for offset in 1..50 {  // Reduced range to prevent cross-function contamination
+      let search_pos = if function_span.lo().0 >= offset {
+        function_span.lo() - swc_common::BytePos(offset)
+      } else {
+        swc_common::BytePos(0)
+      };
+      
+      if let Some(comments) = self.comments.get_leading(search_pos) {
+        for comment in comments {
+          if let Some(annotation) = self.parse_throws_comment(&comment.text) {
+            #[cfg(debug_assertions)]
+            eprintln!("   ✅ Found throws annotation in backward search at -{}: {:?}", offset, annotation);
+            return Some(annotation);
+          }
+        }
+      }
+      
+      // Stop searching if we've gone too far back
+      if search_pos.0 == 0 {
+        break;
+      }
+    }
+
+    #[cfg(debug_assertions)]
+    eprintln!("   ❌ No throws annotation found in leading comments for function span {:?}", function_span);
+    
+    None
+  }
+
+  fn parse_throws_comment(&self, comment_text: &str) -> Option<ThrowsAnnotation> {
+    // Only support JSDoc @throws syntax:
+    // /** @throws {ErrorType} description */
+    // /**
+    //  * Description here
+    //  * @throws {TypeError} when input is invalid
+    //  * @throws {ValidationError} when validation fails
+    //  */
+    let text = comment_text.trim();
+    let mut error_types: std::collections::HashSet<String> = std::collections::HashSet::new(); // Use HashSet to deduplicate
+
+    let lines: Vec<&str> = text.lines()
+      .map(|line| line.trim().trim_start_matches('*').trim())
+      .collect();
+
+    for line in &lines {
+      if line.to_lowercase().contains("@throws") {
+        if let Some(throws_pos) = line.to_lowercase().find("@throws") {
+          let after_throws = &line[throws_pos + 7..].trim(); // Skip "@throws"
+
+          // Handle @throws {Type} syntax
+          if let Some(start_brace) = after_throws.find('{') {
+            if let Some(end_brace) = after_throws.find('}') {
+              let type_name = &after_throws[start_brace + 1..end_brace].trim();
+              if !type_name.is_empty() {
+                error_types.insert(type_name.to_string());
+                continue;
+              }
+            }
+          }
+          // Handle @throws Type (without braces) - extract comma-separated types
+          if !after_throws.starts_with('{') {
+            let type_section = after_throws
+              .split_whitespace()
+              .take_while(|word| {
+                !["when", "if", "where", "that", "which", "while", "because", "since"].contains(&word.to_lowercase().as_str())
+              })
+              .collect::<Vec<_>>()
+              .join(" ");
+            let types: Vec<String> = type_section
+              .split(',')
+              .map(|s| s.trim().trim_end_matches(',').trim().to_string())
+              .filter(|s| !s.is_empty())
+              .collect();
+            for error_type in types {
+              error_types.insert(error_type);
+            }
+          }
+        }
+      }
+    }
+    if !error_types.is_empty() {
+      Some(ThrowsAnnotation { 
+        error_types: error_types.into_iter().collect(), // Convert HashSet back to Vec
+        is_documented: true 
+      })
+    } else {
+      None
     }
   }
 
@@ -231,6 +431,9 @@ impl<'throwfinder_settings> ThrowAnalyzer<'throwfinder_settings> {
     let mut throw_finder = ThrowFinder::new(&self.throwfinder_settings, self.comments.clone());
     throw_finder.visit_arrow_expr(arrow_function);
     if !throw_finder.throw_spans.is_empty() {
+      // NEW: Extract throws annotation from arrow function comments
+      let throws_annotation = self.extract_throws_annotation(arrow_function.span);
+
       let throw_map = ThrowMap {
         throw_spans: throw_finder.throw_spans,
         throw_statement: arrow_function.span,
@@ -252,6 +455,8 @@ impl<'throwfinder_settings> ThrowAnalyzer<'throwfinder_settings> {
             .cloned()
             .unwrap_or_else(|| "<anonymous>".to_string())
         ),
+        throw_details: throw_finder.throw_details,  // NEW: Pass error details from ThrowFinder
+        throws_annotation,                          // NEW: Add throws annotation
       };
       self.functions_with_throws.insert(throw_map);
     }
@@ -261,6 +466,9 @@ impl<'throwfinder_settings> ThrowAnalyzer<'throwfinder_settings> {
     let mut throw_finder = ThrowFinder::new(&self.throwfinder_settings, self.comments.clone());
     throw_finder.visit_constructor(constructor);
     if !throw_finder.throw_spans.is_empty() {
+      // NEW: Extract throws annotation from constructor comments
+      let throws_annotation = self.extract_throws_annotation(constructor.span);
+
       let throw_map = ThrowMap {
         throw_spans: throw_finder.throw_spans,
         throw_statement: constructor.span,
@@ -280,6 +488,8 @@ impl<'throwfinder_settings> ThrowAnalyzer<'throwfinder_settings> {
             .clone()
             .unwrap_or_else(|| "<constructor>".to_string())
         ),
+        throw_details: throw_finder.throw_details,  // NEW: Pass error details from ThrowFinder
+        throws_annotation,                          // NEW: Add throws annotation
       };
       self.functions_with_throws.insert(throw_map);
     }
@@ -371,6 +581,7 @@ impl<'throwfinder_settings> Visit for ThrowAnalyzer<'throwfinder_settings> {
           let mut throw_finder = ThrowFinder::new(&self.throwfinder_settings, self.comments.clone());
           throw_finder.visit_arrow_expr(arrow_expr);
           if !throw_finder.throw_spans.is_empty() {
+            let throws_annotation = self.extract_throws_annotation(arrow_expr.span);
             let throw_map = ThrowMap {
               throw_spans: throw_finder.throw_spans,
               throw_statement: arrow_expr.span,
@@ -392,6 +603,8 @@ impl<'throwfinder_settings> Visit for ThrowAnalyzer<'throwfinder_settings> {
                   .cloned()
                   .unwrap_or_else(|| "<anonymous>".to_string())
               ),
+              throw_details: throw_finder.throw_details,
+              throws_annotation,
             };
             self.functions_with_throws.insert(throw_map);
           }
@@ -427,6 +640,7 @@ impl<'throwfinder_settings> Visit for ThrowAnalyzer<'throwfinder_settings> {
               throw_finder.visit_function(&method_prop.function);
 
               if !throw_finder.throw_spans.is_empty() {
+                let throws_annotation = self.extract_throws_annotation(method_prop.function.span);
                 let throw_map = ThrowMap {
                   throw_spans: throw_finder.throw_spans,
                   throw_statement: method_prop.function.span,
@@ -440,6 +654,8 @@ impl<'throwfinder_settings> Visit for ThrowAnalyzer<'throwfinder_settings> {
                       .unwrap_or_else(|| "NOT_SET".to_string()),
                     method_name
                   ),
+                  throw_details: throw_finder.throw_details,
+                  throws_annotation,
                 };
                 self.functions_with_throws.insert(throw_map);
               }
@@ -456,6 +672,7 @@ impl<'throwfinder_settings> Visit for ThrowAnalyzer<'throwfinder_settings> {
                 let function_name = prop_name_to_string(&key_value_prop.key);
 
                 if !throw_finder.throw_spans.is_empty() {
+                  let throws_annotation = self.extract_throws_annotation(fn_expr.function.span);
                   let throw_map = ThrowMap {
                     throw_spans: throw_finder.throw_spans,
                     throw_statement: fn_expr.function.span,
@@ -469,6 +686,8 @@ impl<'throwfinder_settings> Visit for ThrowAnalyzer<'throwfinder_settings> {
                         .unwrap_or_else(|| "NOT_SET".to_string()),
                       function_name
                     ),
+                    throw_details: throw_finder.throw_details,
+                    throws_annotation,
                   };
                   self.functions_with_throws.insert(throw_map);
                 }
@@ -480,6 +699,7 @@ impl<'throwfinder_settings> Visit for ThrowAnalyzer<'throwfinder_settings> {
                 let function_name = prop_name_to_string(&key_value_prop.key);
 
                 if !throw_finder.throw_spans.is_empty() {
+                  let throws_annotation = self.extract_throws_annotation(arrow_expr.span);
                   let throw_map = ThrowMap {
                     throw_spans: throw_finder.throw_spans,
                     throw_statement: arrow_expr.span,
@@ -493,6 +713,8 @@ impl<'throwfinder_settings> Visit for ThrowAnalyzer<'throwfinder_settings> {
                         .unwrap_or_else(|| "NOT_SET".to_string()),
                       function_name
                     ),
+                    throw_details: throw_finder.throw_details,
+                    throws_annotation,
                   };
                   self.functions_with_throws.insert(throw_map);
                 }
@@ -533,6 +755,7 @@ impl<'throwfinder_settings> Visit for ThrowAnalyzer<'throwfinder_settings> {
         }
 
         if !throw_finder.throw_spans.is_empty() {
+          let throws_annotation = self.extract_throws_annotation(declarator.span);
           let throw_map = ThrowMap {
             throw_spans: throw_finder.throw_spans,
             throw_statement: declarator.span,
@@ -546,6 +769,8 @@ impl<'throwfinder_settings> Visit for ThrowAnalyzer<'throwfinder_settings> {
                 .unwrap_or_else(|| "NOT_SET".to_string()),
               function_name
             ),
+            throw_details: throw_finder.throw_details,
+            throws_annotation,
           };
           self.functions_with_throws.insert(throw_map);
         }
@@ -662,6 +887,7 @@ impl<'throwfinder_settings> Visit for ThrowAnalyzer<'throwfinder_settings> {
       throw_finder.visit_class_method(class_method);
 
       if !throw_finder.throw_spans.is_empty() {
+        let throws_annotation = self.extract_throws_annotation(class_method.span);
         let throw_map = ThrowMap {
           throw_spans: throw_finder.throw_spans,
           throw_statement: class_method.span,
@@ -675,6 +901,8 @@ impl<'throwfinder_settings> Visit for ThrowAnalyzer<'throwfinder_settings> {
               .unwrap_or_else(|| "NOT_SET".to_string()),
             method_name
           ),
+          throw_details: throw_finder.throw_details,
+          throws_annotation,
         };
         self.functions_with_throws.insert(throw_map);
       }
