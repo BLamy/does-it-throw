@@ -1,0 +1,17 @@
+[package]
+name = "what-does-it-throw"
+version = "0.3.0"
+description = "What Does It Throw - A library for finding ES throw statements using SWC"
+license = "MIT"
+documentation = "https://github.com/blamy/what-does-it-throw/blob/main/readme.md"
+repository = "https://github.com/blamy/what-does-it-throw"
+homepage = "https://github.com/blamy/what-does-it-throw/blob/main/readme.md"
+
+[lib]
+bench = false
+
+[dependencies]
+swc_common = "0.33"
+swc_ecma_parser = "0.142.1"
+swc_ecma_ast = "0.111.1"
+swc_ecma_visit = "0.97.1"

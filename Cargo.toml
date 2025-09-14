@@ -6,8 +6,8 @@ authors = [
 ]
 
 members = [
-    "crates/does-it-throw",
-    "crates/does-it-throw-wasm"
+    "crates/what-does-it-throw",
+    "crates/what-does-it-throw-wasm"
 ]
 
 exclude = [

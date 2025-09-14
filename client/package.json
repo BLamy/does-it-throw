@@ -1,6 +1,6 @@
 {
-  "name": "vscode-does-it-throw-client",
-  "description": "VSCode Client for the Does It Throw extension",
+  "name": "vscode-what-does-it-throw-client",
+  "description": "VSCode Client for the What Does It Throw extension",
   "author": {
     "name": "Michael Angelo",
     "email": "email@michaelangelo.io"

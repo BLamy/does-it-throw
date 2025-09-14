@@ -5,12 +5,17 @@ import {
   ProposedFeatures,
   TextDocumentSyncKind,
   TextDocuments,
-  createConnection
+  createConnection,
+  CodeActionKind,
+  CodeAction,
+  CodeActionParams,
+  Range,
+  Position
 } from 'vscode-languageserver/node'
 
 import { access, constants, readFile } from 'fs/promises'
 import { TextDocument } from 'vscode-languageserver-textdocument'
-import { InputData, ParseResult, parse_js } from './rust/does_it_throw_wasm'
+import { InputData, ParseResult, parse_js } from './rust/what_does_it_throw_wasm'
 import path = require('path')
 import { inspect } from 'util'
 
@@ -30,7 +35,10 @@ connection.onInitialize((params: InitializeParams) => {
 
   const result: InitializeResult = {
     capabilities: {
-      textDocumentSync: TextDocumentSyncKind.Incremental
+      textDocumentSync: TextDocumentSyncKind.Incremental,
+      codeActionProvider: {
+        codeActionKinds: [CodeActionKind.QuickFix]
+      }
     }
   }
   if (hasWorkspaceFolderCapability) {
@@ -78,7 +86,7 @@ const defaultSettings: Settings = {
   callToThrowSeverity: 'Hint',
   callToImportedThrowSeverity: 'Hint',
   includeTryStatementThrows: false,
-  ignoreStatements: ['@it-throws', '@does-it-throw-ignore']
+  ignoreStatements: ['@it-throws', '@what-does-it-throw-ignore']
 }
 // 👆 very unlikely someone will have more than 1 million throw statements, lol
 // if you do, might want to rethink your code?
@@ -92,7 +100,7 @@ connection.onDidChangeConfiguration((change) => {
     // Reset all cached document settings
     documentSettings.clear()
   } else {
-    globalSettings = <Settings>(change.settings.doesItThrow || defaultSettings)
+    globalSettings = <Settings>(change.settings.whatDoesItThrow || defaultSettings)
   }
 
   // Revalidate all open text documents
@@ -109,7 +117,7 @@ function getDocumentSettings(resource: string): Thenable<Settings> {
   if (!result) {
     result = connection.workspace.getConfiguration({
       scopeUri: resource,
-      section: 'doesItThrow'
+      section: 'whatDoesItThrow'
     })
     documentSettings.set(resource, result)
   }
@@ -161,12 +169,7 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
   }
   try {
     const opts = {
-      uri: textDocument.uri,
       file_content: textDocument.getText(),
-      ids_to_check: [],
-      typescript_settings: {
-        decorators: true
-      },
       function_throw_severity: settings?.functionThrowSeverity ?? defaultSettings.functionThrowSeverity,
       throw_statement_severity: settings?.throwStatementSeverity ?? defaultSettings.throwStatementSeverity,
       call_to_imported_throw_severity:
@@ -178,6 +181,7 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
     const analysis = parse_js(opts) as ParseResult
 
     if (analysis.relative_imports.length > 0) {
+      const seenImportedThrowIds = new Set<string>();
       const filePromises = analysis.relative_imports.map(async (relative_import) => {
         try {
           const file = await findFirstFileThatExists(textDocument.uri, relative_import)
@@ -196,12 +200,7 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
           return undefined
         }
         const opts = {
-          uri: file.fileUri,
           file_content: file.fileContent,
-          ids_to_check: [],
-          typescript_settings: {
-            decorators: true
-          }
         } satisfies InputData
         return parse_js(opts) as ParseResult
       })
@@ -216,7 +215,9 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
         }
         if (import_analysis.throw_ids.length) {
           for (const throw_id of import_analysis.throw_ids) {
-            const newDiagnostics = analysis.imported_identifiers_diagnostics.get(throw_id)
+            if (seenImportedThrowIds.has(throw_id)) continue;
+            seenImportedThrowIds.add(throw_id);
+            const newDiagnostics = analysis.imported_identifiers_diagnostics.find(item => item.id === throw_id)
             if (newDiagnostics?.diagnostics?.length) {
               analysis.diagnostics.push(...newDiagnostics.diagnostics)
             }
@@ -224,9 +225,36 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
         }
       }
     }
+    // Convert diagnostics to 0-based line indices for LSP/VS Code
+    const zeroBasedDiagnosticsRaw = analysis.diagnostics.map((d) => {
+      try {
+        const startLine = Math.max(0, (d.range?.start?.line ?? 0) - 1)
+        const endLine = Math.max(0, (d.range?.end?.line ?? startLine) - 1)
+        return {
+          ...d,
+          range: {
+            ...d.range,
+            start: { ...d.range.start, line: startLine },
+            end: { ...d.range.end, line: endLine }
+          }
+        }
+      } catch {
+        return d
+      }
+    })
+
+    // Deduplicate diagnostics by range and message to avoid spurious duplicates
+    const seen = new Set<string>()
+    const zeroBasedDiagnostics = zeroBasedDiagnosticsRaw.filter(d => {
+      const key = `${d.message}|${d.range?.start?.line}:${d.range?.start?.character}-${d.range?.end?.line}:${d.range?.end?.character}|${d.severity}|${d.code}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+
     connection.sendDiagnostics({
       uri: textDocument.uri,
-      diagnostics: analysis.diagnostics
+      diagnostics: zeroBasedDiagnostics
     })
   } catch (e) {
     console.log(e)
@@ -241,6 +269,313 @@ connection.onDidChangeWatchedFiles((_change) => {
   // Monitored files have change in VSCode
   connection.console.log(`We received an file change event ${_change}, not implemented yet`)
 })
+
+// Handle code actions for quick fixes
+connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
+  const textDocument = documents.get(params.textDocument.uri)
+  if (!textDocument) {
+    return []
+  }
+
+  const codeActions: CodeAction[] = []
+
+  // Check if there are diagnostics in the range that we can fix
+  for (const diagnostic of params.context.diagnostics) {
+    if (diagnostic.source === 'Does it Throw?' && 
+        diagnostic.message.includes('Exhaustive catch is missing handlers for:')) {
+      
+      // Extract missing error types from the diagnostic message
+      const match = diagnostic.message.match(/missing handlers for: ([^.]+)/)
+      if (match) {
+        const missingTypes = match[1].split(', ').map(type => type.trim())
+        
+        // Get the catch block content to determine where to insert the handlers
+        const catchRange = diagnostic.range
+        const catchLine = textDocument.getText(Range.create(
+          Position.create(catchRange.start.line, 0),
+          Position.create(catchRange.start.line + 10, 0) // Read a few lines to find the catch block
+        ))
+        
+        // Find the position to insert instanceof checks (after the opening brace)
+        const insertPositionStart = findInsertPositionStart(textDocument, catchRange)
+        const insertPositionEnd = findInsertPositionEnd(textDocument, catchRange)
+        
+        if (insertPositionStart) {
+          // Create code action to add instanceof handlers
+          const handlersText = missingTypes.map(errorType => 
+            `    if (e instanceof ${errorType}) {\n      // Handle ${errorType}\n      console.error('${errorType}:', e.message);\n      return null;\n    }`
+          ).join(' else ') + '\n'
+          
+          const addHandlersAction: CodeAction = {
+            title: `Add instanceof handlers for ${missingTypes.join(', ')}`,
+            kind: CodeActionKind.QuickFix,
+            diagnostics: [diagnostic],
+            edit: {
+              changes: {
+                [params.textDocument.uri]: [{
+                  range: Range.create(insertPositionStart, insertPositionStart),
+                  newText: handlersText
+                }]
+              }
+            }
+          }
+          codeActions.push(addHandlersAction)
+        }
+        
+        if (insertPositionEnd) {
+          // Create code action to add escape hatch at the end
+          const escapeHatchAction: CodeAction = {
+            title: "Add 'throw e' as escape hatch",
+            kind: CodeActionKind.QuickFix,
+            diagnostics: [diagnostic],
+            edit: {
+              changes: {
+                [params.textDocument.uri]: [{
+                  range: Range.create(insertPositionEnd, insertPositionEnd),
+                  newText: '    // Escape hatch for unhandled errors\n    throw e;\n'
+                }]
+              }
+            }
+          }
+          codeActions.push(escapeHatchAction)
+        }
+      }
+    } else if (diagnostic.source === 'Does it Throw?' && 
+               (diagnostic.message.match(/^Function .+ may throw(?:: .+)?$/) || diagnostic.message.startsWith('Anonymous function may throw'))) {
+      
+      // Handle function-level diagnostics - add JSDoc @throws or convert anonymous callback
+      const anon = diagnostic.message.startsWith('Anonymous function may throw')
+      const extracted = diagnostic.message.match(/^Function (.+) may throw(?:: (.+))?$/)
+      const functionName = extracted && extracted[1] ? extracted[1] : '<anonymous>'
+      const typesPart = extracted && extracted[2] ? extracted[2] : ''
+      const errorTypes = typesPart.length > 0 ? typesPart.split(', ').map((t: string) => t.trim()) : ['Error']
+
+      // Suggest adding JSDoc before the function/callback
+      const insertPosition = findJSDocInsertPosition(textDocument, diagnostic.range)
+      if (insertPosition) {
+        const jsdocLines = [
+          '/**',
+          ...errorTypes.map((errorType: string) => ` * @throws {${errorType}}`),
+          ' */'
+        ]
+        const jsdocText = jsdocLines.join('\n') + '\n'
+
+        const addJSDocAction: CodeAction = {
+          title: anon ? `Annotate anonymous function with @throws` : `Add JSDoc @throws for ${errorTypes.join(', ')}`,
+          kind: CodeActionKind.QuickFix,
+          diagnostics: [diagnostic],
+          edit: {
+            changes: {
+              [params.textDocument.uri]: [{
+                range: Range.create(insertPosition, insertPosition),
+                newText: jsdocText
+              }]
+            }
+          }
+        }
+        codeActions.push(addJSDocAction)
+      }
+
+      // If anonymous callback, suggest converting to a named function with JSDoc
+      if (anon) {
+        const range = diagnostic.range
+        const callbackText = textDocument.getText(range)
+        // Heuristic: if it looks like an arrow function, replace `() => { ... }` with `function callbackName() { ... }`
+        // We'll choose a friendly default name but keep it easy to rename by user.
+        const replacement = callbackText
+          .replace(/\(\s*([^)]*)\s*\)\s*=>\s*\{/, '/**\n * @throws {Error}\n */\nfunction callbackThrows($1) {')
+          .replace(/\)\s*=>\s*([^\{][^;]*);?$/, ') { return $1; }')
+
+        const convertAction: CodeAction = {
+          title: 'Convert to named function with @throws',
+          kind: CodeActionKind.QuickFix,
+          diagnostics: [diagnostic],
+          edit: {
+            changes: {
+              [params.textDocument.uri]: [{
+                range,
+                newText: replacement
+              }]
+            }
+          }
+        }
+        codeActions.push(convertAction)
+      }
+    } else if (diagnostic.source === 'Does it Throw?' && 
+               diagnostic.message === 'Function call may throw: {Error}.') {
+      
+      // Handle function call diagnostics - add @it-throws comment
+      const insertPosition = findCommentInsertPosition(textDocument, diagnostic.range)
+      
+      if (insertPosition) {
+        const addCommentAction: CodeAction = {
+          title: "Add @it-throws comment to suppress warning",
+          kind: CodeActionKind.QuickFix,
+          diagnostics: [diagnostic],
+          edit: {
+            changes: {
+              [params.textDocument.uri]: [{
+                range: Range.create(insertPosition, insertPosition),
+                newText: getIndentedComment(textDocument, diagnostic.range)
+              }]
+            }
+          }
+        }
+        codeActions.push(addCommentAction)
+      }
+    } else if (diagnostic.source === 'Does it Throw?' && 
+               diagnostic.message.includes('Unused @it-throws comment')) {
+      
+      // Handle unused @it-throws comment diagnostics - offer to remove them
+      const removeCommentAction: CodeAction = {
+        title: "Remove unused @it-throws comment",
+        kind: CodeActionKind.QuickFix,
+        diagnostics: [diagnostic],
+        edit: {
+          changes: {
+            [params.textDocument.uri]: [{
+              range: Range.create(
+                Position.create(diagnostic.range.start.line, 0),
+                Position.create(diagnostic.range.start.line + 1, 0)
+              ),
+              newText: ''
+            }]
+          }
+        }
+      }
+      codeActions.push(removeCommentAction)
+    }
+  }
+
+  return codeActions
+})
+
+// Helper function to find the position to insert code at the start of a catch block
+function findInsertPositionStart(textDocument: TextDocument, diagnosticRange: Range): Position | null {
+  // Start from the diagnostic line and look for the catch block structure
+  const startLine = diagnosticRange.start.line
+  
+  // Look for the opening brace of the catch block
+  for (let line = startLine; line < Math.min(startLine + 10, textDocument.lineCount); line++) {
+    const lineText = textDocument.getText(Range.create(
+      Position.create(line, 0),
+      Position.create(line + 1, 0)
+    ))
+    
+    // Find catch (e) { pattern
+    const catchMatch = lineText.match(/catch\s*\([^)]+\)\s*\{/)
+    if (catchMatch) {
+      // Insert after the opening brace, on the next line with proper indentation
+      return Position.create(line + 1, 0)
+    }
+  }
+  
+  return null
+}
+
+// Helper function to find the position to insert code at the end of a catch block (before closing brace)
+function findInsertPositionEnd(textDocument: TextDocument, diagnosticRange: Range): Position | null {
+  // Start from the diagnostic line and look for the catch block structure
+  const startLine = diagnosticRange.start.line
+  let braceCount = 0
+  let foundCatchStart = false
+  
+  // Look for the catch block and track braces to find the end
+  for (let line = startLine; line < Math.min(startLine + 20, textDocument.lineCount); line++) {
+    const lineText = textDocument.getText(Range.create(
+      Position.create(line, 0),
+      Position.create(line + 1, 0)
+    ))
+    
+    // Find catch (e) { pattern
+    if (!foundCatchStart && lineText.match(/catch\s*\([^)]+\)\s*\{/)) {
+      foundCatchStart = true
+      braceCount = 1
+      continue
+    }
+    
+    if (foundCatchStart) {
+      // Count braces to find the matching closing brace
+      for (const char of lineText) {
+        if (char === '{') braceCount++
+        if (char === '}') braceCount--
+        
+        if (braceCount === 0) {
+          // Found the closing brace, insert before it
+          return Position.create(line, 0)
+        }
+      }
+    }
+  }
+  
+  return null
+}
+
+// Helper function to find the position to insert JSDoc before a function
+function findJSDocInsertPosition(textDocument: TextDocument, diagnosticRange: Range): Position | null {
+  // The diagnostic range should cover the function declaration
+  // We want to insert JSDoc right before the function starts
+  const startLine = diagnosticRange.start.line
+  
+  // Look backwards from the diagnostic line to find any existing comments or the actual start
+  let insertLine = startLine
+  for (let line = startLine - 1; line >= 0; line--) {
+    const lineText = textDocument.getText(Range.create(
+      Position.create(line, 0),
+      Position.create(line + 1, 0)
+    )).trim()
+    
+    // If we hit a non-empty line that's not a comment, stop here
+    if (lineText && !lineText.startsWith('//') && !lineText.startsWith('/*') && !lineText.startsWith('*')) {
+      insertLine = line + 1
+      break
+    }
+    
+    // If we hit the beginning of the file, insert at the start
+    if (line === 0) {
+      insertLine = 0
+      break
+    }
+  }
+  
+  return Position.create(insertLine, 0)
+}
+
+// Helper function to find the position to insert @it-throws comment before a function call
+function findCommentInsertPosition(textDocument: TextDocument, diagnosticRange: Range): Position | null {
+  // The diagnostic range covers the function call
+  // We want to insert the comment on the line directly above
+  const callLine = diagnosticRange.start.line
+  
+  // Get the indentation of the current line to match it
+  const currentLineText = textDocument.getText(Range.create(
+    Position.create(callLine, 0),
+    Position.create(callLine + 1, 0)
+  ))
+  
+  // Extract indentation (spaces or tabs at the start of the line)
+  const indentMatch = currentLineText.match(/^(\s*)/)
+  const indent = indentMatch ? indentMatch[1] : ''
+  
+  return Position.create(callLine, 0)
+}
+
+// Helper function to get properly indented @it-throws comment
+function getIndentedComment(textDocument: TextDocument, diagnosticRange: Range): string {
+  const callLine = diagnosticRange.start.line
+  
+  // Get the indentation of the current line to match it
+  const currentLineText = textDocument.getText(Range.create(
+    Position.create(callLine, 0),
+    Position.create(callLine + 1, 0)
+  ))
+  
+  // Extract indentation (spaces or tabs at the start of the line)
+  const indentMatch = currentLineText.match(/^(\s*)/)
+  const indent = indentMatch ? indentMatch[1] : ''
+  
+  return `${indent}// @it-throws\n`
+}
 
 // Make the text document manager listen on the connection
 // for open, change and close text document events

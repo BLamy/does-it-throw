@@ -1,24 +1,24 @@
 {
-  "name": "does-it-throw-vscode",
-  "version": "0.5.0",
+  "name": "what-does-it-throw",
+  "version": "0.0.1-beta.1",
   "main": "./client/out/extension.js",
-  "displayName": "Does It Throw?",
-  "description": "easily find throw statements in your JS, TS, and JSX files!",
+  "displayName": "What does it throw",
+  "description": "What does it throw - Find throw statements in JavaScript, TypeScript, JSX, and TSX files",
   "repository": {
-    "url": "https://github.com/michaelangeloio/does-it-throw"
+    "url": "https://github.com/blamy/what-does-it-throw"
   },
   "icon": "assets/icon-small.png",
   "author": {
-    "name": "Michael Angelo",
-    "email": "email@michaelangelo.io"
+    "name": "Brett Lamy",
+    "email": "brettlamy@gmail.com"
   },
   "categories": [
-    "Programming Languages",
     "Linters",
     "Debuggers"
   ],
   "keywords": [
-    "does it throw",
+    "what does it throw",
+    "wdit",
     "throw finder",
     "throw",
     "javascript",
@@ -54,13 +54,19 @@
   ],
   "devDependencies": {
     "@biomejs/biome": "^1.5.3",
+    "@commitlint/cli": "^19.8.1",
+    "@commitlint/config-conventional": "^19.8.1",
     "@types/node": "^20.11.6",
+    "@vitest/ui": "^3.2.4",
     "@vscode/vsce": "^2.22.0",
     "bun-types": "^1.0.25",
     "chokidar": "^3.5.3",
+    "diff": "^8.0.2",
     "esbuild": "^0.19.12",
     "esbuild-plugin-copy": "^2.1.1",
-    "typescript": "5.3.3"
+    "husky": "^9.1.7",
+    "typescript": "5.3.3",
+    "vitest": "^3.2.4"
   },
   "activationEvents": [
     "onLanguage:typescript",
@@ -73,7 +79,7 @@
       "type": "object",
       "title": "Example configuration",
       "properties": {
-        "doesItThrow.throwStatementSeverity": {
+        "whatDoesItThrow.throwStatementSeverity": {
           "scope": "resource",
           "type": "string",
           "enum": [
@@ -85,7 +91,7 @@
           "default": "Hint",
           "description": "Controls the severity level of a throw statement."
         },
-        "doesItThrow.functionThrowSeverity": {
+        "whatDoesItThrow.functionThrowSeverity": {
           "scope": "resource",
           "type": "string",
           "enum": [
@@ -97,7 +103,7 @@
           "default": "Hint",
           "description": "Controls the severity level of a function/const that throws."
         },
-        "doesItThrow.callToThrowSeverity": {
+        "whatDoesItThrow.callToThrowSeverity": {
           "scope": "resource",
           "type": "string",
           "enum": [
@@ -109,7 +115,7 @@
           "default": "Hint",
           "description": "Controls the severity level of a function/const that calls a function that throws in the same file."
         },
-        "doesItThrow.callToImportedThrowSeverity": {
+        "whatDoesItThrow.callToImportedThrowSeverity": {
           "scope": "resource",
           "type": "string",
           "enum": [
@@ -121,19 +127,19 @@
           "default": "Hint",
           "description": "Controls the severity level of a function/const that calls a function that throws in a different file."
         },
-        "doesItThrow.maxNumberOfProblems": {
+        "whatDoesItThrow.maxNumberOfProblems": {
           "scope": "resource",
           "type": "number",
           "default": 100,
           "description": "Controls the maximum number of problems produced by the server."
         },
-        "doesItThrow.includeTryStatementThrows": {
+        "whatDoesItThrow.includeTryStatementThrows": {
           "scope": "resource",
           "type": "boolean",
           "default": false,
           "description": "Include throw statements inside try statements."
         },
-        "doesItThrow.ignoreStatements": {
+        "whatDoesItThrow.ignoreStatements": {
           "scope": "resource",
           "type": "array",
           "items": {
@@ -141,11 +147,11 @@
           },
           "default": [
             "@it-throws",
-            "@does-it-throw-ignore"
+            "@what-does-it-throw-ignore"
           ],
           "description": "Ignore throw statements with comments above that match these strings."
         },
-        "doesItThrow.trace.server": {
+        "whatDoesItThrow.trace.server": {
           "scope": "window",
           "type": "string",
           "enum": [
@@ -173,7 +179,13 @@
     "vscode:package": "vsce package",
     "format": "biome format .",
     "pack:server": "npm pack --workspace server",
-    "publish:server": "npm publish --workspace server"
+    "publish:server": "npm publish --workspace server",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:run": "vitest run",
+    "test:watch": "vitest --watch",
+    "commitlint": "commitlint --edit",
+    "prepare": "husky"
   },
   "types": "index.d.ts",
   "workspaces": [
