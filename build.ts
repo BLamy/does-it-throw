@@ -1,7 +1,7 @@
 import { watch } from 'chokidar'
 import { build as esbuild } from 'esbuild'
 import copy from 'esbuild-plugin-copy'
-import { Errorlike, readableStreamToText } from 'bun'
+import { readableStreamToText } from 'bun'
 
 const log = (...args: any[]) => console.log('\x1b[36m%s\x1b[0m', '[builder]', ...args)
 const logError = (...args: any[]) => console.log('\x1b[31m%s\x1b[0m', '[builder]', ...args)
@@ -31,7 +31,7 @@ const compile = async ({
 
   const compileWasm = async () => {
     // TODO - use bun to bundle the code when it supports CJS (or vscode supports ESM)
-    const command = 'wasm-pack build crates/does-it-throw-wasm --target nodejs --out-dir ../../server/src/rust'
+    const command = 'wasm-pack build crates/what-does-it-throw-wasm --target nodejs --out-dir ../../server/src/rust'
     log('building wasm')
     const { stdout, exited } = Bun.spawn(command.split(' '), {
       cwd: __dirname
@@ -191,6 +191,9 @@ const compile = async ({
   return errors
 }
 
+/**
+ * @throws {Error} if there are errors compiling
+ */
 async function main() {
   const isWatch = process.argv.includes('--watch')
   if (!isWatch) {
@@ -244,4 +247,5 @@ async function main() {
   })
 }
 
+// @it-throws
 main()

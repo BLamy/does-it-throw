@@ -88,4 +88,55 @@ To run unit tests on the WebAssembly module, simply run the following at the pro
 cargo test
 ```
 
+## Commit Message Format
+
+This project uses [Conventional Commits](https://www.conventionalcommits.org/) enforced by [commitlint](https://commitlint.js.org/). All commit messages must follow this format:
+
+```
+<type>[optional scope]: <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+### Allowed Types
+
+- `feat`: A new feature
+- `fix`: A bug fix
+- `docs`: Documentation only changes
+- `style`: Changes that do not affect the meaning of the code
+- `refactor`: A code change that neither fixes a bug nor adds a feature
+- `perf`: A code change that improves performance
+- `test`: Adding missing tests or correcting existing tests
+- `build`: Changes that affect the build system or external dependencies
+- `ci`: Changes to our CI configuration files and scripts
+- `chore`: Other changes that don't modify src or test files
+- `revert`: Reverts a previous commit
+
+### Examples
+
+```bash
+feat: add getter and setter detection for object literals
+fix(wasm): resolve memory corruption in diagnostic generation
+docs: update contributing guidelines for commit format
+test: add comprehensive tests for function finder
+```
+
+### Commit Message Rules
+
+- Use the imperative mood in the subject line (e.g., "add" not "adds" or "adding")
+- Do not end the subject line with a period
+- Keep the subject line under 100 characters
+- Capitalize the subject line
+- Use lowercase for type and scope
+- Separate the subject from the body with a blank line
+
+The commit message format is automatically validated using git hooks. If your commit message doesn't follow the format, the commit will be rejected.
+
+To test a commit message format:
+
+```bash
+echo "feat: your commit message" | bun run commitlint
+```
 

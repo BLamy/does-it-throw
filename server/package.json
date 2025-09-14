@@ -1,6 +1,6 @@
 {
-  "name": "does-it-throw-lsp",
-  "description": "Language Server for Does It Throw",
+  "name": "what-does-it-throw-lsp",
+  "description": "Language Server for What Does It Throw",
   "version": "0.5.0",
   "//": "target-version: 0.5.0",
   "author": {
@@ -24,7 +24,8 @@
     "Debuggers"
   ],
   "keywords": [
-    "does it throw",
+    "what does it throw",
+    "wdit",
     "throw finder",
     "throw",
     "javascript",
@@ -49,7 +50,7 @@
   ],
   "main": "out/server.js",
   "bin": {
-    "does-it-throw-lsp": "./bin/does-it-throw"
+    "what-does-it-throw-lsp": "./bin/what-does-it-throw"
   },
   "scripts": {}
 }
